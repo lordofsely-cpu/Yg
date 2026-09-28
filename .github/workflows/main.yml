@@ -1,0 +1,214 @@
+name: Build Sely Launcher APK
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build Sely Launcher
+    runs-on: ubuntu-24.04
+
+    steps:
+
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Configure Android SDK
+        shell: bash
+        run: |
+          set -e
+
+          SDKMANAGER="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
+
+          if [ ! -f "$SDKMANAGER" ]; then
+            SDKMANAGER=$(find "$ANDROID_HOME/cmdline-tools" \
+              -type f \
+              -name sdkmanager \
+              2>/dev/null | head -n 1)
+          fi
+
+          if [ -z "$SDKMANAGER" ]; then
+            echo "ERROR: sdkmanager not found."
+            exit 1
+          fi
+
+          echo "Using sdkmanager: $SDKMANAGER"
+
+          "$SDKMANAGER" --version
+
+          yes | "$SDKMANAGER" --licenses || true
+
+          "$SDKMANAGER" \
+            "platform-tools" \
+            "platforms;android-34" \
+            "build-tools;34.0.0"
+
+      - name: Verify Android SDK
+        run: |
+          test -d "$ANDROID_HOME/platforms/android-34"
+          test -d "$ANDROID_HOME/build-tools/34.0.0"
+
+          echo "Android SDK is ready."
+
+      - name: Find Sely Launcher ZIP
+        shell: bash
+        run: |
+          ZIP_FILE=$(find . -maxdepth 2 -type f \
+            -iname "*.zip" \
+            ! -path "./.git/*" \
+            | head -n 1)
+
+          if [ -z "$ZIP_FILE" ]; then
+            echo "ERROR: No ZIP file found."
+            exit 1
+          fi
+
+          echo "Found:"
+          echo "$ZIP_FILE"
+
+          echo "ZIP_FILE=$ZIP_FILE" >> "$GITHUB_ENV"
+
+      - name: Extract Sely Launcher
+        run: |
+          rm -rf project
+          mkdir -p project
+
+          unzip -o "$ZIP_FILE" -d project
+
+          echo "Extracted project:"
+          find project -maxdepth 3 -type f | sort
+
+      - name: Locate Android project
+        shell: bash
+        run: |
+          SETTINGS=$(find project \
+            \( -name settings.gradle.kts -o -name settings.gradle \) \
+            | head -n 1)
+
+          if [ -z "$SETTINGS" ]; then
+            echo "ERROR: Android Gradle project not found."
+            exit 1
+          fi
+
+          PROJECT_DIR=$(dirname "$SETTINGS")
+
+          echo "Android project:"
+          echo "$PROJECT_DIR"
+
+          echo "PROJECT_DIR=$PROJECT_DIR" >> "$GITHUB_ENV"
+
+      - name: Configure AndroidX
+        working-directory: ${{ env.PROJECT_DIR }}
+        run: |
+          cat > gradle.properties <<'EOF'
+          android.useAndroidX=true
+          android.enableJetifier=true
+          org.gradle.jvmargs=-Xmx2048m -Dfile.encoding=UTF-8
+          EOF
+
+      - name: Fix RecoverableSecurityException import
+        working-directory: ${{ env.PROJECT_DIR }}
+        shell: bash
+        run: |
+          FILE=$(find app/src/main/java \
+            -name "FileHubActivity.kt" \
+            | head -n 1)
+
+          if [ -z "$FILE" ]; then
+            echo "ERROR: FileHubActivity.kt not found."
+            exit 1
+          fi
+
+          echo "Found:"
+          echo "$FILE"
+
+          if grep -q "RecoverableSecurityException" "$FILE"; then
+
+            if ! grep -q "import android.app.RecoverableSecurityException" "$FILE"; then
+              echo "Adding missing import..."
+
+              sed -i \
+                '/^package /a import android.app.RecoverableSecurityException' \
+                "$FILE"
+            else
+              echo "Import already exists."
+            fi
+
+          else
+            echo "RecoverableSecurityException is not used."
+          fi
+
+          echo "Imports now:"
+          head -n 30 "$FILE"
+
+      - name: Verify project
+        working-directory: ${{ env.PROJECT_DIR }}
+        run: |
+          test -f app/build.gradle.kts || test -f app/build.gradle
+          test -d app/src/main
+
+          echo "Project verification successful."
+
+      - name: Prepare Gradle
+        working-directory: ${{ env.PROJECT_DIR }}
+        run: |
+          if [ -f gradlew ]; then
+            chmod +x gradlew
+          else
+            echo "Gradle wrapper not found."
+
+            wget -q \
+              https://services.gradle.org/distributions/gradle-8.7-bin.zip
+
+            unzip -q gradle-8.7-bin.zip
+
+            ./gradle-8.7/bin/gradle wrapper \
+              --gradle-version 8.7
+
+            chmod +x gradlew
+          fi
+
+      - name: Build Sely Launcher Debug APK
+        working-directory: ${{ env.PROJECT_DIR }}
+        run: |
+          ./gradlew assembleDebug --stacktrace
+
+      - name: Find APK
+        shell: bash
+        run: |
+          APK=$(find "$PROJECT_DIR" \
+            -type f \
+            -name "*.apk" \
+            | head -n 1)
+
+          if [ -z "$APK" ]; then
+            echo "ERROR: APK was not generated."
+            exit 1
+          fi
+
+          echo "================================"
+          echo "Sely Launcher APK generated!"
+          echo "================================"
+
+          echo "APK_PATH=$APK" >> "$GITHUB_ENV"
+
+          ls -lh "$APK"
+
+      - name: Upload Sely Launcher APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: Sely-Launcher-APK
+          path: ${{ env.APK_PATH }}
+          if-no-files-found: error
